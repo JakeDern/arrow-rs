@@ -48,6 +48,77 @@ use crate::compression::CompressionCodec;
 pub use crate::compression::CompressionContext;
 use crate::convert::IpcSchemaEncoder;
 
+enum IpcStreamToken<'a> {
+    Continuation([u8; 4]),
+    MetadataSize([u8; 4]),
+    MetadataFlatBuffer(MetadataFlatBuffer<'a>),
+    // TODO: What goes here?
+    Padding(),
+    // TODO: How do we model this. We probably need to emit the body buffers
+    // one at a time, this might need to be some kind of borrowed iterator
+    MessageBody(IpcMessageBodyToken<'a>),
+}
+
+enum IpcMessageBodyToken<'a> {
+    Padding(&'a [u8]),
+    // TODO: Is this some kind of iterator?
+    Body(&'a [u8]),
+}
+
+enum MetadataFlatBuffer<'a> {
+    Schema(&'a [u8]),
+    Dictionary(&'a [u8]),
+    RecordBatch(&'a [u8]),
+}
+
+struct StreamEncoder {
+    write_options: IpcWriteOptions,
+    tracker: DictionaryTracker,
+    fbb: FlatBufferBuilder<'static>,
+    finished: bool,
+}
+
+impl StreamEncoder {
+    fn new(write_options: IpcWriteOptions) -> Self {
+        Self {
+            write_options,
+            tracker: DictionaryTracker::new(false),
+            fbb: FlatBufferBuilder::new(),
+            finished: false,
+        }
+    }
+
+    fn encode_record_batch(&mut self, rb: RecordBatch) -> TokenIterator<'_> {
+        TokenIterator {
+            tracker: &mut self.tracker,
+            fbb: &mut self.fbb,
+            rb,
+        }
+    }
+}
+
+struct TokenIterator<'a> {
+    tracker: &'a mut DictionaryTracker,
+    fbb: &'a mut FlatBufferBuilder<'static>,
+    rb: RecordBatch,
+}
+
+impl<'a> TokenIterator<'a> {
+    fn new(encoder: &'a mut StreamEncoder, rb: RecordBatch) -> Result<Self, ArrowError> {
+        // TODO: Do some kind of initialization here, maybe walk/shred the rb,
+        // figure out the number of metadata blocks, etc.
+        Ok(Self {
+            tracker: &mut encoder.tracker,
+            fbb: &mut encoder.fbb,
+            rb,
+        })
+    }
+
+    fn next(&mut self) -> Option<IpcStreamToken<'_>> {
+        todo!()
+    }
+}
+
 /// IPC write options used to control the behaviour of the [`IpcDataGenerator`]
 #[derive(Debug, Clone)]
 pub struct IpcWriteOptions {

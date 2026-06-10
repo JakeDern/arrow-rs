@@ -1,3 +1,4 @@
+use std::cmp::max;
 use std::convert::Infallible;
 use std::ops::{Deref, DerefMut};
 
@@ -38,7 +39,10 @@ unsafe impl<'a> Allocator for IpcAllocator<'a> {
     type Error = Infallible;
 
     fn grow_downwards(&mut self) -> Result<(), Self::Error> {
-        todo!()
+        let old_len = self.buf.len();
+        let new_len = max(1, old_len * 2);
+
+        Ok(())
     }
 
     fn len(&self) -> usize {
