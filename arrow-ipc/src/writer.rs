@@ -24,6 +24,8 @@
 //!
 //! [`Seek`]: std::io::Seek
 
+mod allocator;
+
 use std::cmp::min;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
