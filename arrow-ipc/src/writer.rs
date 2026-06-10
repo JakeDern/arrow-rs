@@ -543,18 +543,20 @@ impl IpcDataGenerator {
             write_options,
             compression_context,
         )?;
+        let mut fbb = FlatBufferBuilder::new();
         let mut arrow_data = Vec::new();
-        let (ipc_message, _, tail_pad) = self.record_batch_to_bytes(
+        let (_, tail_pad) = self.record_batch_to_bytes(
             batch,
             write_options,
             compression_context,
             &mut IpcBodySink::Write(&mut arrow_data),
+            &mut fbb,
         )?;
         arrow_data.extend_from_slice(&PADDING[..tail_pad]);
         Ok((
             encoded_dictionaries,
             EncodedData {
-                ipc_message,
+                ipc_message: fbb.finished_data().to_vec(),
                 arrow_data,
             },
         ))
@@ -595,6 +597,7 @@ impl IpcDataGenerator {
         write_options: &IpcWriteOptions,
         compression_context: &mut CompressionContext,
         writer: &mut W,
+        fbb: &mut FlatBufferBuilder<'static>,
     ) -> Result<IpcWriteMetadata, ArrowError> {
         let encoded_dictionaries = self.encode_all_dicts(
             batch,
@@ -614,12 +617,14 @@ impl IpcDataGenerator {
             .map(|a| estimate_encoded_buffer_count(a.data_type()))
             .sum();
         let mut encoded_buffers: Vec<EncodedBuffer> = Vec::with_capacity(capacity);
-        let (ipc_message, body_len, tail_pad) = self.record_batch_to_bytes(
+        let (body_len, tail_pad) = self.record_batch_to_bytes(
             batch,
             write_options,
             compression_context,
             &mut IpcBodySink::Collect(&mut encoded_buffers),
+            fbb,
         )?;
+        let ipc_message = fbb.finished_data();
 
         let alignment = write_options.alignment;
         let a = usize::from(alignment - 1);
@@ -634,7 +639,7 @@ impl IpcDataGenerator {
             write_options,
             (aligned_size - prefix_size) as i32,
         )?;
-        writer.write_all(&ipc_message)?;
+        writer.write_all(ipc_message)?;
         writer.write_all(&PADDING[..aligned_size - ipc_message.len() - prefix_size])?;
         for enc in &encoded_buffers {
             writer.write_all(enc.as_slice())?;
@@ -678,8 +683,11 @@ impl IpcDataGenerator {
         write_options: &IpcWriteOptions,
         compression_context: &mut CompressionContext,
         sink: &mut IpcBodySink<'_>,
-    ) -> Result<(Vec<u8>, usize, usize), ArrowError> {
-        let mut fbb = FlatBufferBuilder::new();
+        fbb: &mut FlatBufferBuilder<'static>,
+    ) -> Result<(usize, usize), ArrowError> {
+        // Reuse the builder's internal buffer across messages; `reset` keeps the
+        // allocated capacity and only clears the in-progress state.
+        fbb.reset();
 
         let mut nodes: Vec<crate::FieldNode> = vec![];
         let mut buffers: Vec<crate::Buffer> = vec![];
@@ -687,7 +695,7 @@ impl IpcDataGenerator {
         let batch_compression_type = write_options.batch_compression_type;
 
         let compression = batch_compression_type.map(|batch_compression_type| {
-            let mut c = crate::BodyCompressionBuilder::new(&mut fbb);
+            let mut c = crate::BodyCompressionBuilder::new(&mut *fbb);
             c.add_method(crate::BodyCompressionMethod::BUFFER);
             c.add_codec(batch_compression_type);
             c.finish()
@@ -729,7 +737,7 @@ impl IpcDataGenerator {
         };
 
         let root = {
-            let mut batch_builder = crate::RecordBatchBuilder::new(&mut fbb);
+            let mut batch_builder = crate::RecordBatchBuilder::new(&mut *fbb);
             batch_builder.add_length(batch.num_rows() as i64);
             batch_builder.add_nodes(nodes);
             batch_builder.add_buffers(buffers);
@@ -742,7 +750,7 @@ impl IpcDataGenerator {
             batch_builder.finish().as_union_value()
         };
         // create an crate::Message
-        let mut message = crate::MessageBuilder::new(&mut fbb);
+        let mut message = crate::MessageBuilder::new(&mut *fbb);
         message.add_version(write_options.metadata_version);
         message.add_header_type(crate::MessageHeader::RecordBatch);
         message.add_bodyLength(body_len as i64);
@@ -750,7 +758,9 @@ impl IpcDataGenerator {
         let root = message.finish();
         fbb.finish(root, None);
 
-        Ok((fbb.finished_data().to_vec(), body_len, tail_pad))
+        // The finished metadata lives in `fbb`'s internal buffer; callers read it
+        // via `fbb.finished_data()` to avoid an intermediate copy.
+        Ok((body_len, tail_pad))
     }
 
     /// Write dictionary values into two sets of bytes, one for the header (crate::Message) and the
@@ -1235,6 +1245,10 @@ pub struct FileWriter<W> {
     data_gen: IpcDataGenerator,
 
     compression_context: CompressionContext,
+
+    /// Reusable flatbuffer builder, shared across all messages to avoid
+    /// reallocating its internal buffer on every batch.
+    fbb: FlatBufferBuilder<'static>,
 }
 
 impl<W: Write> FileWriter<BufWriter<W>> {
@@ -1297,6 +1311,7 @@ impl<W: Write> FileWriter<W> {
             custom_metadata: HashMap::new(),
             data_gen,
             compression_context: CompressionContext::default(),
+            fbb: FlatBufferBuilder::new(),
         })
     }
 
@@ -1319,6 +1334,7 @@ impl<W: Write> FileWriter<W> {
             &self.write_options,
             &mut self.compression_context,
             &mut self.writer,
+            &mut self.fbb,
         )?;
 
         for (header_len, body_len) in meta.dictionary_block_sizes {
@@ -1526,6 +1542,10 @@ pub struct StreamWriter<W> {
     data_gen: IpcDataGenerator,
 
     compression_context: CompressionContext,
+
+    /// Reusable flatbuffer builder, shared across all messages to avoid
+    /// reallocating its internal buffer on every batch.
+    fbb: FlatBufferBuilder<'static>,
 }
 
 impl<W: Write> StreamWriter<BufWriter<W>> {
@@ -1577,6 +1597,7 @@ impl<W: Write> StreamWriter<W> {
             dictionary_tracker,
             data_gen,
             compression_context: CompressionContext::default(),
+            fbb: FlatBufferBuilder::new(),
         })
     }
 
@@ -1594,6 +1615,7 @@ impl<W: Write> StreamWriter<W> {
             &self.write_options,
             &mut self.compression_context,
             &mut self.writer,
+            &mut self.fbb,
         )?;
         Ok(())
     }
