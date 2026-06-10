@@ -1044,7 +1044,9 @@ pub enum DictionaryUpdate {
 #[derive(Debug)]
 pub struct DictionaryTracker {
     // NOTE: When adding fields, update the clear() method accordingly.
-    written: HashMap<i64, ArrayData>,
+    // Stores the dictionary *values* array (not the whole column) keyed by id,
+    // so the unchanged-dictionary check is a cheap `Arc` pointer comparison.
+    written: HashMap<i64, ArrayRef>,
     dict_ids: Vec<i64>,
     error_on_replacement: bool,
 }
@@ -1094,18 +1096,17 @@ impl DictionaryTracker {
     ///   inserted.
     #[deprecated(since = "56.1.0", note = "Use `insert_column` instead")]
     pub fn insert(&mut self, dict_id: i64, column: &ArrayRef) -> Result<bool, ArrowError> {
-        let dict_data = column.to_data();
-        let dict_values = &dict_data.child_data()[0];
+        let dict_values = column.as_any_dictionary().values();
 
         // If a dictionary with this id was already emitted, check if it was the same.
         if let Some(last) = self.written.get(&dict_id) {
-            if ArrayData::ptr_eq(&last.child_data()[0], dict_values) {
+            if Arc::ptr_eq(last, dict_values) {
                 // Same dictionary values => no need to emit it again
                 return Ok(false);
             }
             if self.error_on_replacement {
                 // If error on replacement perform a logical comparison
-                if last.child_data()[0] == *dict_values {
+                if last.to_data() == dict_values.to_data() {
                     // Same dictionary values => no need to emit it again
                     return Ok(false);
                 }
@@ -1118,7 +1119,7 @@ impl DictionaryTracker {
             }
         }
 
-        self.written.insert(dict_id, dict_data);
+        self.written.insert(dict_id, dict_values.clone());
         Ok(true)
     }
 
@@ -1143,24 +1144,32 @@ impl DictionaryTracker {
         column: &ArrayRef,
         dict_handling: DictionaryHandling,
     ) -> Result<DictionaryUpdate, ArrowError> {
-        let new_data = column.to_data();
-        let new_values = &new_data.child_data()[0];
+        // Grab the values array directly instead of materialising the whole
+        // dictionary column as `ArrayData`. On the hot path (an unchanged
+        // dictionary reused across batches) this avoids the cost of rebuilding
+        // `ArrayData` just to do a pointer comparison.
+        let new_values = column.as_any_dictionary().values();
 
         // If there is no existing dictionary with this ID, we always insert
-        let Some(old) = self.written.get(&dict_id) else {
-            self.written.insert(dict_id, new_data);
+        let Some(old_values) = self.written.get(&dict_id) else {
+            self.written.insert(dict_id, new_values.clone());
             return Ok(DictionaryUpdate::New);
         };
 
-        // Fast path - If the array data points to the same buffer as the
-        // existing then they're the same.
-        let old_values = &old.child_data()[0];
-        if ArrayData::ptr_eq(old_values, new_values) {
+        // Fast path - the values array is the same allocation as the one we
+        // last wrote, so the dictionary is unchanged. (A shared `Arc` implies
+        // identical buffers, so this is a subset of the old buffer-pointer
+        // check; differing allocations fall through to the value comparison.)
+        if Arc::ptr_eq(old_values, new_values) {
             return Ok(DictionaryUpdate::None);
         }
 
-        // Slow path - Compare the dictionaries value by value
-        let comparison = compare_dictionaries(old_values, new_values);
+        // Slow path - Compare the dictionaries value by value. This only
+        // materialises `ArrayData` when the dictionaries actually differ, which
+        // is also when we are about to (re)serialise the dictionary anyway.
+        let old_data = old_values.to_data();
+        let new_data = new_values.to_data();
+        let comparison = compare_dictionaries(&old_data, &new_data);
         if matches!(comparison, DictionaryComparison::Equal) {
             return Ok(DictionaryUpdate::None);
         }
@@ -1177,7 +1186,7 @@ impl DictionaryTracker {
                     ));
                 }
 
-                self.written.insert(dict_id, new_data);
+                self.written.insert(dict_id, new_values.clone());
                 Ok(DictionaryUpdate::Replaced)
             }
             DictionaryComparison::Delta => match dict_handling {
@@ -1188,13 +1197,12 @@ impl DictionaryTracker {
                         ));
                     }
 
-                    self.written.insert(dict_id, new_data);
+                    self.written.insert(dict_id, new_values.clone());
                     Ok(DictionaryUpdate::Replaced)
                 }
                 DictionaryHandling::Delta => {
-                    let delta =
-                        new_values.slice(old_values.len(), new_values.len() - old_values.len());
-                    self.written.insert(dict_id, new_data);
+                    let delta = new_data.slice(old_data.len(), new_data.len() - old_data.len());
+                    self.written.insert(dict_id, new_values.clone());
                     Ok(DictionaryUpdate::Delta(delta))
                 }
             },
